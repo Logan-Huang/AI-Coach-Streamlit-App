@@ -57,8 +57,31 @@ def run_cmd(cmd: List[str]) -> subprocess.CompletedProcess[str]:
     return proc
 
 
+def ffmpeg_executable() -> Optional[str]:
+    """Return a usable FFmpeg executable.
+
+    Streamlit Cloud apt packages can be fragile across Debian image updates, so
+    this app first checks for a system FFmpeg and then falls back to the
+    imageio-ffmpeg Python wheel, which bundles a static FFmpeg binary.
+    """
+    system_ffmpeg = shutil.which("ffmpeg")
+    if system_ffmpeg:
+        return system_ffmpeg
+
+    try:
+        import imageio_ffmpeg
+
+        bundled_ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+        if bundled_ffmpeg and os.path.exists(bundled_ffmpeg):
+            return bundled_ffmpeg
+    except Exception:
+        return None
+
+    return None
+
+
 def ffmpeg_available() -> bool:
-    return shutil.which("ffmpeg") is not None
+    return ffmpeg_executable() is not None
 
 
 def convert_to_mp4_if_needed(video_path: str, out_dir: str, force: bool = False) -> str:
@@ -68,13 +91,14 @@ def convert_to_mp4_if_needed(video_path: str, out_dir: str, force: bool = False)
     if ext in {".mp4", ".m4v"} and not force:
         return video_path
 
-    if not ffmpeg_available():
+    ffmpeg = ffmpeg_executable()
+    if not ffmpeg:
         return video_path
 
     output_name = safe_filename(Path(video_path).stem) + "_converted.mp4"
     out_path = os.path.join(out_dir, output_name)
     run_cmd([
-        "ffmpeg",
+        ffmpeg,
         "-y",
         "-i",
         video_path,
@@ -171,10 +195,11 @@ def _make_web_friendly_video(raw_path: str, final_path: str) -> Optional[str]:
     if not raw_path or not os.path.exists(raw_path) or os.path.getsize(raw_path) == 0:
         return None
 
-    if ffmpeg_available():
+    ffmpeg = ffmpeg_executable()
+    if ffmpeg:
         try:
             run_cmd([
-                "ffmpeg",
+                ffmpeg,
                 "-y",
                 "-i",
                 raw_path,

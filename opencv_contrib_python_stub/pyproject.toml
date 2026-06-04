@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "opencv-contrib-python"
+version = "4.11.0.86"
+description = "Compatibility shim that satisfies MediaPipe's OpenCV dependency while installing the headless OpenCV build for Streamlit Cloud."
+requires-python = ">=3.9"
+dependencies = [
+    "opencv-contrib-python-headless==4.11.0.86",
+]
+
+[tool.setuptools]
+packages = []

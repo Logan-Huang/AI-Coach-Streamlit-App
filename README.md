@@ -10,6 +10,18 @@ The app lets a user upload a tennis video, runs MediaPipe pose tracking, extract
 - `report.md`: rule-based coaching report
 - `tennis_ai_outputs.zip`: all generated outputs
 
+## Important Streamlit Cloud fix
+
+This version intentionally does **not** include `packages.txt`.
+
+The earlier package requested apt packages such as `ffmpeg`, `libgl1`, and `libglib2.0-0`. On current Streamlit Cloud images, that can produce Debian dependency conflicts before Python packages are installed. This version avoids those apt packages by:
+
+- using a headless OpenCV wheel, so no GUI/OpenGL Linux packages are needed;
+- using `imageio-ffmpeg`, so FFmpeg is available from Python instead of apt;
+- adding a small local compatibility shim so MediaPipe's `opencv-contrib-python` dependency resolves to `opencv-contrib-python-headless`.
+
+If your GitHub repo already has the old file, delete `packages.txt` from the repo before redeploying.
+
 ## Project files
 
 ```text
@@ -17,7 +29,8 @@ tennis-ai-coach/
 ├── app.py
 ├── tennis_analysis.py
 ├── requirements.txt
-├── packages.txt
+├── opencv_contrib_python_stub/
+│   └── pyproject.toml
 ├── .python-version
 ├── .gitignore
 ├── .streamlit/
@@ -49,14 +62,13 @@ streamlit run app.py
 
 ## Deploy on Streamlit Community Cloud
 
-1. Create a new GitHub repository.
+1. Create a new GitHub repository, or update your existing repository.
 2. Upload all files in this folder to the repository root.
-3. Go to Streamlit Community Cloud and create a new app.
-4. Select the GitHub repository and branch.
-5. Set the main file path to `app.py`.
-6. Deploy.
-
-If the app fails while installing MediaPipe, open the app's advanced settings and select Python 3.11, then redeploy.
+3. Make sure `packages.txt` is not in the repository.
+4. Go to Streamlit Community Cloud and create or redeploy the app.
+5. Select the GitHub repository and branch.
+6. Set the main file path to `app.py`.
+7. Use Python 3.11 in Streamlit advanced settings, then deploy.
 
 ## Notes and limitations
 
