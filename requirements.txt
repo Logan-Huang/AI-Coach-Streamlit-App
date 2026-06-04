@@ -1,0 +1,5 @@
+streamlit>=1.35,<2
+mediapipe==0.10.21
+opencv-contrib-python>=4.9,<5
+numpy==1.26.4
+pandas>=2.2,<3
