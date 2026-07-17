@@ -10,17 +10,23 @@ The app lets a user upload a tennis video, runs MediaPipe pose tracking, extract
 - `report.md`: rule-based coaching report
 - `tennis_ai_outputs.zip`: all generated outputs
 
-## Important Streamlit Cloud fix
+## Important Streamlit Cloud notes
 
-This version intentionally does **not** include `packages.txt`.
+This version targets **Python 3.14** and **mediapipe 0.10.35** using MediaPipe's current
+Tasks API (`PoseLandmarker`). The legacy `mp.solutions` API this app originally used was
+removed from mediapipe 0.10.31+, and older mediapipe versions have no Python 3.14 wheels.
+The pose model (`pose_landmarker_lite/full/heavy.task`, ~5-29 MB) is downloaded from
+Google's model storage on first use and cached in the temp directory.
 
-The earlier package requested apt packages such as `ffmpeg`, `libgl1`, and `libglib2.0-0`. On current Streamlit Cloud images, that can produce Debian dependency conflicts before Python packages are installed. This version avoids those apt packages by:
+`packages.txt` contains exactly one apt package: `libportaudio2`. mediapipe's Tasks
+import chain pulls in `sounddevice`, which needs the PortAudio system library on Linux.
+It is a tiny leaf package and does not reintroduce the heavy apt packages (`ffmpeg`,
+`libgl1`, `libglib2.0-0`) that caused Debian dependency conflicts in earlier versions.
+Those are still avoided by:
 
 - using a headless OpenCV wheel, so no GUI/OpenGL Linux packages are needed;
 - using `imageio-ffmpeg`, so FFmpeg is available from Python instead of apt;
-- adding a small local compatibility shim so MediaPipe's `opencv-contrib-python` dependency resolves to `opencv-contrib-python-headless`.
-
-If your GitHub repo already has the old file, delete `packages.txt` from the repo before redeploying.
+- a small local compatibility shim so MediaPipe's `opencv-contrib-python` dependency resolves to `opencv-contrib-python-headless`.
 
 ## Project files
 
@@ -29,6 +35,7 @@ tennis-ai-coach/
 ├── app.py
 ├── tennis_analysis.py
 ├── requirements.txt
+├── packages.txt
 ├── opencv_contrib_python_stub/
 │   └── pyproject.toml
 ├── .python-version
@@ -63,12 +70,17 @@ streamlit run app.py
 ## Deploy on Streamlit Community Cloud
 
 1. Create a new GitHub repository, or update your existing repository.
-2. Upload all files in this folder to the repository root.
-3. Make sure `packages.txt` is not in the repository.
-4. Go to Streamlit Community Cloud and create or redeploy the app.
-5. Select the GitHub repository and branch.
-6. Set the main file path to `app.py`.
-7. Use Python 3.11 in Streamlit advanced settings, then deploy.
+2. Upload all files in this folder to the repository root (including `packages.txt`).
+3. Go to Streamlit Community Cloud and create or redeploy the app.
+4. Select the GitHub repository and branch.
+5. Set the main file path to `app.py`.
+6. Select **Python 3.14** in Streamlit advanced settings, then deploy.
+
+Note: only the "Python version" dropdown in Advanced settings controls the deployed
+interpreter — no file in the repo does (`.python-version` is for local tooling only).
+The Python version cannot be changed after deployment; to switch it you must delete
+the app and redeploy. If you add `packages.txt` to an already-deployed app and the
+deploy logs show no apt install phase, delete and redeploy to force a fresh container.
 
 ## Notes and limitations
 

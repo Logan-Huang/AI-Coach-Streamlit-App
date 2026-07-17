@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import os
+import shutil
 import tempfile
 from typing import Dict, Optional
 
@@ -68,7 +69,15 @@ def run_pipeline(
     annotate_video: bool,
     force_convert: bool,
 ) -> Dict[str, object]:
+    # One work dir per session run: drop the previous run's artifacts so temp
+    # disk usage stays bounded on Streamlit Cloud.
+    prev_dir = st.session_state.pop("work_dir", None)
+    if prev_dir and os.path.isdir(prev_dir):
+        shutil.rmtree(prev_dir, ignore_errors=True)
+    st.session_state.pop("result", None)
+
     work_dir = tempfile.mkdtemp(prefix="tennis_ai_")
+    st.session_state["work_dir"] = work_dir
     input_name = safe_filename(uploaded_file.name)
     input_path = os.path.join(work_dir, input_name)
     with open(input_path, "wb") as f:
@@ -79,7 +88,9 @@ def run_pipeline(
     progress = st.progress(0)
 
     status.info("Preparing video...")
-    video_path = convert_to_mp4_if_needed(input_path, out_dir, force=force_convert)
+    # Convert into work_dir (not out_dir) so the input video is not bundled
+    # into the downloadable outputs ZIP.
+    video_path = convert_to_mp4_if_needed(input_path, work_dir, force=force_convert)
 
     cfg = AnalysisConfig(
         sample_stride=sample_stride,
@@ -107,9 +118,11 @@ def run_pipeline(
     report_md = render_report_md(input_name, meta, summary, hitting_arm, good, focus)
     bundle_paths = save_output_bundle(out_dir, metrics_df, strokes_df, report_md, meta)
 
-    annotated_bytes = read_bytes(str(meta.get("annotated_video")))
+    annotated_path = meta.get("annotated_video")
     status.success("Analysis complete.")
 
+    # Large artifacts (annotated video, zip) stay on disk and are read lazily
+    # at render time instead of living in session_state for the whole session.
     return {
         "input_name": input_name,
         "metrics_df": metrics_df,
@@ -122,8 +135,8 @@ def run_pipeline(
         "metrics_csv_bytes": to_csv_bytes(metrics_df),
         "strokes_csv_bytes": to_csv_bytes(strokes_df),
         "report_bytes": report_md.encode("utf-8"),
-        "zip_bytes": read_bytes(bundle_paths["zip"]),
-        "annotated_video_bytes": annotated_bytes,
+        "zip_path": bundle_paths["zip"],
+        "annotated_video_path": str(annotated_path) if annotated_path else None,
     }
 
 
@@ -134,7 +147,7 @@ with st.sidebar:
     st.header("Analysis settings")
     sample_stride = st.slider("Process every Nth frame", min_value=1, max_value=8, value=2, help="Higher values are faster but less detailed.")
     max_processed_frames = st.number_input("Max processed frames", min_value=0, max_value=100000, value=0, step=100, help="0 means analyze the whole video.")
-    model_complexity = st.select_slider("Pose model complexity", options=[0, 1, 2], value=1, help="0 is fastest. 2 can be more stable but slower.")
+    model_complexity = st.select_slider("Pose model complexity", options=[0, 1, 2], value=1, help="0 = lite (fastest), 1 = full, 2 = heavy (most accurate, slowest). The matching pose model is downloaded on first use.")
     min_det_conf = st.slider("Minimum detection confidence", 0.1, 0.9, 0.5, 0.05)
     min_track_conf = st.slider("Minimum tracking confidence", 0.1, 0.9, 0.5, 0.05)
     annotate_video = st.checkbox("Create annotated video", value=True)
@@ -144,7 +157,7 @@ uploaded = st.file_uploader("Upload a tennis video", type=["mp4", "mov", "m4v", 
 
 left, right = st.columns([1, 2])
 with left:
-    run_clicked = st.button("Run analysis", type="primary", disabled=uploaded is None, use_container_width=True)
+    run_clicked = st.button("Run analysis", type="primary", disabled=uploaded is None, width="stretch")
 with right:
     if uploaded is not None:
         st.write(f"Selected: `{uploaded.name}`")
@@ -209,37 +222,42 @@ with charts_tab:
 
 with data_tab:
     st.write("Swing moments")
-    st.dataframe(strokes_df, use_container_width=True)
+    st.dataframe(strokes_df, width="stretch")
     st.write("Per-frame metrics")
-    st.dataframe(metrics_df, use_container_width=True)
+    st.dataframe(metrics_df, width="stretch")
 
 with video_tab:
-    video_bytes = result.get("annotated_video_bytes")
-    if video_bytes:
-        st.video(video_bytes)
+    video_path = result.get("annotated_video_path")
+    if video_path and os.path.exists(video_path):
+        st.video(video_path)
     else:
         st.info("No annotated video was generated. Enable 'Create annotated video' and rerun if you want one.")
 
 with downloads_tab:
     st.write("Download everything as a ZIP, or download individual files.")
-    st.download_button(
-        "Download all outputs (.zip)",
-        data=result["zip_bytes"],
-        file_name="tennis_ai_outputs.zip",
-        mime="application/zip",
-        use_container_width=True,
-    )
+    zip_bytes = read_bytes(result.get("zip_path"))
+    if zip_bytes:
+        st.download_button(
+            "Download all outputs (.zip)",
+            data=zip_bytes,
+            file_name="tennis_ai_outputs.zip",
+            mime="application/zip",
+            width="stretch",
+        )
+    else:
+        st.warning("The output bundle is no longer on disk. Rerun the analysis to regenerate it.")
     col1, col2, col3 = st.columns(3)
-    col1.download_button("metrics.csv", data=result["metrics_csv_bytes"], file_name="metrics.csv", mime="text/csv", use_container_width=True)
-    col2.download_button("strokes.csv", data=result["strokes_csv_bytes"], file_name="strokes.csv", mime="text/csv", use_container_width=True)
-    col3.download_button("report.md", data=result["report_bytes"], file_name="report.md", mime="text/markdown", use_container_width=True)
-    if result.get("annotated_video_bytes"):
+    col1.download_button("metrics.csv", data=result["metrics_csv_bytes"], file_name="metrics.csv", mime="text/csv", width="stretch")
+    col2.download_button("strokes.csv", data=result["strokes_csv_bytes"], file_name="strokes.csv", mime="text/csv", width="stretch")
+    col3.download_button("report.md", data=result["report_bytes"], file_name="report.md", mime="text/markdown", width="stretch")
+    annotated_dl = read_bytes(result.get("annotated_video_path"))
+    if annotated_dl:
         st.download_button(
             "annotated_video.mp4",
-            data=result["annotated_video_bytes"],
+            data=annotated_dl,
             file_name="annotated_video.mp4",
             mime="video/mp4",
-            use_container_width=True,
+            width="stretch",
         )
 
 with st.expander("Technical metadata"):

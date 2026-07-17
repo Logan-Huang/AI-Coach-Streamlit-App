@@ -1,6 +1,6 @@
-streamlit>=1.35,<2
-numpy==1.26.4
+streamlit>=1.59,<1.60
+numpy>=2.3.3,<3
 pandas>=2.2,<3
 imageio-ffmpeg>=0.5,<1
 ./opencv_contrib_python_stub
-mediapipe==0.10.21
+mediapipe==0.10.35

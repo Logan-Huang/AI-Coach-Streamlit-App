@@ -6,9 +6,13 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
+import threading
+import urllib.request
 import warnings
 import zipfile
 from dataclasses import asdict, dataclass
+from enum import IntEnum
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -17,8 +21,41 @@ import mediapipe as mp
 import numpy as np
 import pandas as pd
 
-mp_pose = mp.solutions.pose
-mp_drawing = mp.solutions.drawing_utils
+_MODEL_URLS = {
+    "lite": "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/latest/pose_landmarker_lite.task",
+    "full": "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/latest/pose_landmarker_full.task",
+    "heavy": "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_heavy/float16/latest/pose_landmarker_heavy.task",
+}
+_COMPLEXITY_TO_MODEL = {0: "lite", 1: "full", 2: "heavy"}
+_MODEL_MIN_BYTES = 1_000_000
+_download_lock = threading.Lock()
+
+
+class PoseIdx(IntEnum):
+    """Pose landmark indices (unchanged between the legacy Solutions API and the Tasks API)."""
+
+    LEFT_SHOULDER = 11
+    RIGHT_SHOULDER = 12
+    LEFT_ELBOW = 13
+    RIGHT_ELBOW = 14
+    LEFT_WRIST = 15
+    RIGHT_WRIST = 16
+    LEFT_HIP = 23
+    RIGHT_HIP = 24
+    LEFT_KNEE = 25
+    RIGHT_KNEE = 26
+    LEFT_ANKLE = 27
+    RIGHT_ANKLE = 28
+
+
+# Standard 33-landmark skeleton topology (the Tasks API ships no drawing helper).
+_POSE_CONNECTIONS = (
+    (0, 1), (1, 2), (2, 3), (3, 7), (0, 4), (4, 5), (5, 6), (6, 8), (9, 10),
+    (11, 12), (11, 13), (13, 15), (15, 17), (15, 19), (15, 21), (17, 19),
+    (12, 14), (14, 16), (16, 18), (16, 20), (16, 22), (18, 20),
+    (11, 23), (12, 24), (23, 24), (23, 25), (24, 26), (25, 27), (26, 28),
+    (27, 29), (28, 30), (29, 31), (30, 32), (27, 31), (28, 32),
+)
 
 ProgressCallback = Optional[Callable[[int, Optional[int]], None]]
 
@@ -44,14 +81,70 @@ def safe_filename(name: str, default: str = "uploaded_video.mp4") -> str:
     return base or default
 
 
-def run_cmd(cmd: List[str]) -> subprocess.CompletedProcess[str]:
-    proc = subprocess.run(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        check=False,
-    )
+def _model_cache_dir() -> str:
+    base = os.environ.get("TENNIS_AI_MODEL_DIR") or os.path.join(tempfile.gettempdir(), "tennis_ai_models")
+    return ensure_dir(base)
+
+
+def model_name_for_complexity(complexity: int) -> str:
+    return _COMPLEXITY_TO_MODEL.get(int(complexity), "full")
+
+
+def ensure_pose_model(model_name: str = "full") -> str:
+    """Download the PoseLandmarker .task model once and cache it on disk."""
+    if model_name not in _MODEL_URLS:
+        raise ValueError(f"Unknown pose model: {model_name!r}")
+    dest = os.path.join(_model_cache_dir(), f"pose_landmarker_{model_name}.task")
+    if os.path.exists(dest) and os.path.getsize(dest) >= _MODEL_MIN_BYTES:
+        return dest
+    url = _MODEL_URLS[model_name]
+    with _download_lock:
+        if os.path.exists(dest) and os.path.getsize(dest) >= _MODEL_MIN_BYTES:
+            return dest
+        fd, tmp = tempfile.mkstemp(suffix=".task", dir=_model_cache_dir())
+        os.close(fd)
+        last_err: Optional[Exception] = None
+        try:
+            for _ in range(2):
+                try:
+                    with urllib.request.urlopen(url, timeout=60) as resp, open(tmp, "wb") as out:
+                        shutil.copyfileobj(resp, out)
+                    if os.path.getsize(tmp) < _MODEL_MIN_BYTES:
+                        raise RuntimeError("Downloaded model file looks truncated.")
+                    os.replace(tmp, dest)
+                    return dest
+                except Exception as exc:
+                    last_err = exc
+        finally:
+            if os.path.exists(tmp):
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+    raise RuntimeError(f"Could not download pose model '{model_name}' from {url}: {last_err}")
+
+
+def _draw_pose(frame: np.ndarray, landmarks, width: int, height: int) -> None:
+    pts = [(int(round(lm.x * width)), int(round(lm.y * height))) for lm in landmarks]
+    for a, b in _POSE_CONNECTIONS:
+        if a < len(pts) and b < len(pts):
+            cv2.line(frame, pts[a], pts[b], (255, 255, 255), 2, cv2.LINE_AA)
+    for p in pts:
+        cv2.circle(frame, p, 3, (0, 200, 0), -1, cv2.LINE_AA)
+
+
+def run_cmd(cmd: List[str], timeout_s: float = 600.0) -> subprocess.CompletedProcess[str]:
+    try:
+        proc = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            check=False,
+            timeout=timeout_s,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"Command timed out after {int(timeout_s)}s: " + " ".join(cmd)) from exc
     if proc.returncode != 0:
         raise RuntimeError("Command failed: " + " ".join(cmd) + "\n\n" + proc.stdout)
     return proc
@@ -226,9 +319,13 @@ def _make_web_friendly_video(raw_path: str, final_path: str) -> Optional[str]:
         except Exception:
             pass
 
-    if os.path.abspath(raw_path) != os.path.abspath(final_path):
-        shutil.move(raw_path, final_path)
-    return final_path if os.path.exists(final_path) else None
+    # Without FFmpeg the raw mp4v file will not play in the browser's HTML5
+    # player, so drop it rather than presenting an unplayable video.
+    try:
+        os.remove(raw_path)
+    except OSError:
+        pass
+    return None
 
 
 def analyze_video(
@@ -253,7 +350,6 @@ def analyze_video(
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-    dt = (1.0 / fps) * max(1, int(cfg.sample_stride))
 
     writer = None
     raw_annotated_path = os.path.join(out_dir, "annotated_video_raw.mp4")
@@ -266,16 +362,26 @@ def analyze_video(
             writer.release()
             writer = None
 
-    pose = mp_pose.Pose(
-        static_image_mode=False,
-        model_complexity=int(cfg.model_complexity),
-        enable_segmentation=False,
-        min_detection_confidence=float(cfg.min_det_conf),
-        min_tracking_confidence=float(cfg.min_track_conf),
-    )
+    try:
+        model_path = ensure_pose_model(model_name_for_complexity(cfg.model_complexity))
+        landmarker = mp.tasks.vision.PoseLandmarker.create_from_options(
+            mp.tasks.vision.PoseLandmarkerOptions(
+                base_options=mp.tasks.BaseOptions(model_asset_path=model_path),
+                running_mode=mp.tasks.vision.RunningMode.VIDEO,
+                num_poses=1,
+                min_pose_detection_confidence=float(cfg.min_det_conf),
+                min_tracking_confidence=float(cfg.min_track_conf),
+            )
+        )
+    except Exception:
+        cap.release()
+        if writer is not None:
+            writer.release()
+        raise
 
-    landmark_enum = mp_pose.PoseLandmark
     prev_pts = {"LEFT_WRIST": None, "RIGHT_WRIST": None}
+    prev_frame_i = {"LEFT_WRIST": None, "RIGHT_WRIST": None}
+    last_ts = -1
     rows: List[Dict[str, float | int]] = []
     frame_i = -1
     processed = 0
@@ -295,8 +401,13 @@ def analyze_video(
                 continue
 
             time_s = frame_i / fps
+            timestamp_ms = int(round(time_s * 1000.0))
+            if timestamp_ms <= last_ts:
+                timestamp_ms = last_ts + 1
+            last_ts = timestamp_ms
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            result = pose.process(rgb)
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=np.ascontiguousarray(rgb))
+            result = landmarker.detect_for_video(mp_image, timestamp_ms)
 
             left_knee = right_knee = float("nan")
             left_elbow = right_elbow = float("nan")
@@ -307,20 +418,20 @@ def analyze_video(
             left_wrist_speed = right_wrist_speed = float("nan")
 
             if result.pose_landmarks:
-                lm = result.pose_landmarks.landmark
+                lm = result.pose_landmarks[0]
 
-                l_sh = _lm_xy(lm, landmark_enum.LEFT_SHOULDER.value, width, height)
-                r_sh = _lm_xy(lm, landmark_enum.RIGHT_SHOULDER.value, width, height)
-                l_hp = _lm_xy(lm, landmark_enum.LEFT_HIP.value, width, height)
-                r_hp = _lm_xy(lm, landmark_enum.RIGHT_HIP.value, width, height)
-                l_kn = _lm_xy(lm, landmark_enum.LEFT_KNEE.value, width, height)
-                r_kn = _lm_xy(lm, landmark_enum.RIGHT_KNEE.value, width, height)
-                l_an = _lm_xy(lm, landmark_enum.LEFT_ANKLE.value, width, height)
-                r_an = _lm_xy(lm, landmark_enum.RIGHT_ANKLE.value, width, height)
-                l_el = _lm_xy(lm, landmark_enum.LEFT_ELBOW.value, width, height)
-                r_el = _lm_xy(lm, landmark_enum.RIGHT_ELBOW.value, width, height)
-                l_wr = _lm_xy(lm, landmark_enum.LEFT_WRIST.value, width, height)
-                r_wr = _lm_xy(lm, landmark_enum.RIGHT_WRIST.value, width, height)
+                l_sh = _lm_xy(lm, PoseIdx.LEFT_SHOULDER, width, height)
+                r_sh = _lm_xy(lm, PoseIdx.RIGHT_SHOULDER, width, height)
+                l_hp = _lm_xy(lm, PoseIdx.LEFT_HIP, width, height)
+                r_hp = _lm_xy(lm, PoseIdx.RIGHT_HIP, width, height)
+                l_kn = _lm_xy(lm, PoseIdx.LEFT_KNEE, width, height)
+                r_kn = _lm_xy(lm, PoseIdx.RIGHT_KNEE, width, height)
+                l_an = _lm_xy(lm, PoseIdx.LEFT_ANKLE, width, height)
+                r_an = _lm_xy(lm, PoseIdx.RIGHT_ANKLE, width, height)
+                l_el = _lm_xy(lm, PoseIdx.LEFT_ELBOW, width, height)
+                r_el = _lm_xy(lm, PoseIdx.RIGHT_ELBOW, width, height)
+                l_wr = _lm_xy(lm, PoseIdx.LEFT_WRIST, width, height)
+                r_wr = _lm_xy(lm, PoseIdx.RIGHT_WRIST, width, height)
 
                 left_knee = angle_deg(l_hp, l_kn, l_an)
                 right_knee = angle_deg(r_hp, r_kn, r_an)
@@ -338,16 +449,24 @@ def analyze_video(
                 if math.isfinite(ankle_dist) and math.isfinite(hip_dist) and hip_dist > 1e-6:
                     stance_ratio = float(ankle_dist / hip_dist)
 
-                if prev_pts["LEFT_WRIST"] is not None:
-                    left_wrist_speed = float(np.linalg.norm(l_wr - prev_pts["LEFT_WRIST"]) / dt)
-                if prev_pts["RIGHT_WRIST"] is not None:
-                    right_wrist_speed = float(np.linalg.norm(r_wr - prev_pts["RIGHT_WRIST"]) / dt)
+                # Divide by the real elapsed time since the wrist was last seen,
+                # so pose-detection gaps do not inflate speeds into false peaks.
+                if prev_pts["LEFT_WRIST"] is not None and prev_frame_i["LEFT_WRIST"] is not None:
+                    gap_s = (frame_i - prev_frame_i["LEFT_WRIST"]) / fps
+                    if gap_s > 0:
+                        left_wrist_speed = float(np.linalg.norm(l_wr - prev_pts["LEFT_WRIST"]) / gap_s)
+                if prev_pts["RIGHT_WRIST"] is not None and prev_frame_i["RIGHT_WRIST"] is not None:
+                    gap_s = (frame_i - prev_frame_i["RIGHT_WRIST"]) / fps
+                    if gap_s > 0:
+                        right_wrist_speed = float(np.linalg.norm(r_wr - prev_pts["RIGHT_WRIST"]) / gap_s)
 
                 prev_pts["LEFT_WRIST"] = l_wr
                 prev_pts["RIGHT_WRIST"] = r_wr
+                prev_frame_i["LEFT_WRIST"] = frame_i
+                prev_frame_i["RIGHT_WRIST"] = frame_i
 
                 if writer is not None:
-                    mp_drawing.draw_landmarks(frame, result.pose_landmarks, mp_pose.POSE_CONNECTIONS)
+                    _draw_pose(frame, lm, width, height)
 
             if writer is not None:
                 overlay = (
@@ -380,7 +499,7 @@ def analyze_video(
                 break
     finally:
         cap.release()
-        pose.close()
+        landmarker.close()
         if writer is not None:
             writer.release()
 
@@ -445,9 +564,9 @@ def build_strokes_df(metrics_df: pd.DataFrame, fps: float, sample_stride: int) -
     hitting_arm = pick_hitting_arm(metrics_df)
     speed_col = "left_wrist_speed_px_s" if hitting_arm == "LEFT" else "right_wrist_speed_px_s"
     speed = metrics_df[speed_col].to_numpy(dtype=float)
+    # p95 over real (finite) speeds only, so undetected frames don't drag the threshold down.
+    p95 = safe_percentile(speed, 95, default=0.0)
     speed = np.nan_to_num(speed, nan=0.0, posinf=0.0, neginf=0.0)
-
-    p95 = float(np.percentile(speed, 95)) if len(speed) else 0.0
     thresh = max(300.0, 0.35 * p95)
     min_gap = int(round(0.45 * float(fps) / max(1, int(sample_stride))))
     peaks = detect_peaks_1d(speed, thresh=thresh, min_gap=min_gap)
